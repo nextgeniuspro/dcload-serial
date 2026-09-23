@@ -162,6 +162,21 @@ general_1:
 	mov.l @r0,r0
 	jsr @r0
 	nop
+! tell the host: dcloadsyscall(15 = exit, 0xdead0000 | EXPEVT).
+! The serial link is still at whatever rate the program was using, and
+! dcloadsyscall itself checks the console-enabled magic at 0x8c004004 and
+! does nothing when there is no host listening. Without this, dc-tool's
+! console sits waiting for a command byte that never comes, because dcload's
+! main() is about to drop back to INITIAL_SPEED.
+	mov.l expevt,r5
+	mov.l @r5,r5
+	mov.l dead_k,r0
+	or r0,r5
+	mov #15,r4
+	mov.l syscall_k,r0
+	mov.l @r0,r0
+	jsr @r0
+	nop
 ! return to bootloader
 	mov.l entry_addr,r0
 	jmp @r0
@@ -171,6 +186,10 @@ stack_addr:
 	.long 0x8d000000
 exc_to_string_k:
 	.long 0x8c00401c
+dead_k:
+	.long 0xdead0000
+syscall_k:
+	.long 0x8c004008
 		
 regdump:
 ! save registers for display

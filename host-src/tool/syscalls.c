@@ -40,6 +40,7 @@
 #endif
 #include "syscalls.h"
 #include "dc-io.h"
+void blread(void *buf, int count);
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -206,6 +207,26 @@ void dc_write(void) {
         log_msg(LOG_WRITE, "write", "'%s'", get_filename(filedes));
 
     send_uint(retval);
+
+    free(data);
+}
+
+/* Command 23: console output with no reply (dcload-serial 1.0.10+). The
+   Dreamcast has already moved on; just print it. */
+void dc_write_nowait(void) {
+    int filedes;
+    unsigned int count;
+    unsigned char *data;
+
+    filedes = recv_uint();
+    count = recv_uint();
+
+    data = malloc(count ? count : 1);
+    blread(data, count);
+
+    if(write(filedes, data, count) < 0) {
+        /* stdout gone (a closed pipe); nothing useful to do about it */
+    }
 
     free(data);
 }
@@ -724,9 +745,20 @@ void dc_gdbpacket(void) {
 }
 
 void dc_exit(void) {
-    int exit_code = (int32_t) recv_uint();
-    printf("Program returned %d\n", exit_code);
+    unsigned int code = recv_uint();
+
+    /* dcload's exception handler reports itself as 0xdead0000 | EXPEVT before
+       it drops back to the loader, so the console can stop cleanly here
+       instead of waiting forever for a program that no longer exists. */
+    if((code & 0xffff0000) == 0xdead0000) {
+        printf("\nDreamcast raised an exception (EXPEVT 0x%03x); "
+               "the register dump is on the console's screen.\n", code & 0xffff);
+        finish_serial();
+        exit(3);
+    }
+
+    printf("Program returned %d\n", (int)code);
     finish_serial();
-    exit(exit_code);
+    exit((int)code);
 }
 

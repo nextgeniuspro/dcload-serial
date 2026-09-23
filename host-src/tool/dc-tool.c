@@ -57,6 +57,12 @@
 #else
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
+#include <errno.h>
+#include <stdarg.h>
 #endif
 #ifdef __APPLE__
 #include <IOKit/serial/ioss.h>
@@ -82,7 +88,11 @@ SOCKET gdb_server_socket = 0;
 SOCKET socket_fd = 0;
 #endif
 
-#define INITIAL_SPEED   57600
+/* The rate dcload boots at. Must match the target's DCLOAD_INITIAL_SPEED;
+   both come from Makefile.cfg. Overridable at run time with -B. */
+#ifndef INITIAL_SPEED
+#define INITIAL_SPEED   312500
+#endif
 
 #define DCLOADBUFFER    16384 /* was 8192 */
 #ifdef _WIN32
@@ -242,6 +252,292 @@ HANDLE hCommPort;
 BOOL bDebugSocketStarted = FALSE;
 #endif /* _WIN32 */
 
+/* ------------------------------------------------------------------------- */
+/* Transport                                                                 */
+/* ------------------------------------------------------------------------- */
+/*
+ * Two ways to reach dcload:
+ *
+ *   serial   a tty, as always (-t /dev/ttyUSB0)
+ *   tcp      the esp32-dc bridge directly (-t tcp:esp32-dc.local[:2323])
+ *
+ * The bridge is a transparent byte pipe, so the dcload protocol is identical
+ * either way. What differs is the baud rate: over TCP there is no tty to set
+ * it on, so dc-tool tells the ESP32 through a small line-oriented control
+ * port (data port + 1, default 2324) whenever dcload's rate changes. That is
+ * what makes the 'S' speed change work through the bridge, and it also lets
+ * dc-tool put the bridge back to INITIAL_SPEED at start-up, so a rate left
+ * over from a previous run can never wedge the next one.
+ */
+
+typedef enum { XP_SERIAL, XP_TCP } transport_t;
+
+static transport_t xport = XP_SERIAL;
+unsigned int initial_speed = INITIAL_SPEED;
+int io_timeout_ms = 5000;
+
+/* Pipelining: send a block's header, size, payload and checksum in one write
+   and only then collect the echo and the ack, instead of waiting for the size
+   echo first. One round trip per block instead of two -- and over Wi-Fi the
+   round trip is the cost. Only safe with a target that can take bytes while
+   it is echoing (dcload-serial 1.0.8+, which has a software receive FIFO);
+   detected at start-up with the 'V' command, never assumed. */
+static int pipelined = 0;
+static int no_pipeline = 0;
+
+/* Streaming ('b', dcload-serial 1.0.9+): whole batches of blocks per ack.
+   The target parks compressed blocks in a scratch area we choose, clear of
+   everything being loaded; see load_stream() in the target's dcload.c. */
+static int streaming = 0;
+static int console_nowait = 0;             /* dcload 1.0.10+: command 23 */
+static unsigned int cur_speed = 0;         /* line rate right now */
+
+#define STREAM_SCRATCH_LEN  (512 * 1024)
+#define STREAM_BATCH_WIRE   (256 * 1024)   /* bytes on the wire per ack */
+#define STREAM_MAX_BLOCKS   128
+#define STREAM_RAM_START    0x8c010000u
+#define STREAM_RAM_END      0x8d000000u     /* 16 MB retail console */
+
+#define MAX_RANGES 64
+static unsigned int range_lo[MAX_RANGES], range_hi[MAX_RANGES];
+static int nranges;
+static unsigned int stream_scratch;         /* 0 = none found */
+
+static void note_range(unsigned int lo, unsigned int size) {
+    if(nranges < MAX_RANGES) {
+        range_lo[nranges] = lo;
+        range_hi[nranges] = lo + size;
+        nranges++;
+    }
+    else {
+        /* Too many to track safely: do not stream this upload. */
+        nranges = MAX_RANGES + 1;
+    }
+}
+
+/* Highest 64 KB-aligned window of RAM that no section touches. */
+static void choose_scratch(void) {
+    unsigned int top;
+
+    stream_scratch = 0;
+
+    if(nranges > MAX_RANGES)
+        return;
+
+    for(top = STREAM_RAM_END; top - STREAM_SCRATCH_LEN >= STREAM_RAM_START;
+        top -= 0x10000) {
+        unsigned int lo = top - STREAM_SCRATCH_LEN;
+        int i, clash = 0;
+
+        for(i = 0; i < nranges && !clash; i++) {
+            /* compare on physical addresses; sections may be P1 or P2 */
+            unsigned int a = (range_lo[i] & 0x1fffffff) | 0x80000000;
+            unsigned int b = a + (range_hi[i] - range_lo[i]);
+
+            if(a < top && b > lo)
+                clash = 1;
+        }
+
+        if(!clash) {
+            stream_scratch = lo;
+            return;
+        }
+    }
+}
+
+#ifndef _WIN32
+static int tcp_fd = -1;
+static char tcp_host[256];
+static unsigned int tcp_port = 2323;
+static unsigned int tcp_ctl_port = 2324;
+static int ctl_warned = 0;
+static int ctl_available = 1;
+
+/* "tcp:host[:port]" selects TCP outright; "host:port" does too when no such
+   file exists. Everything else is a tty. */
+static int parse_transport(const char *dev) {
+    const char *p = dev;
+    const char *colon;
+
+    if(!strncmp(p, "tcp:", 4))
+        p += 4;
+    else if(!strchr(p, ':') || access(p, F_OK) == 0)
+        return 0;
+
+    colon = strrchr(p, ':');
+
+    if(colon) {
+        snprintf(tcp_host, sizeof(tcp_host), "%.*s", (int)(colon - p), p);
+        tcp_port = strtoul(colon + 1, NULL, 10);
+        if(!tcp_port)
+            tcp_port = 2323;
+    }
+    else {
+        snprintf(tcp_host, sizeof(tcp_host), "%s", p);
+    }
+
+    tcp_ctl_port = tcp_port + 1;
+    xport = XP_TCP;
+
+    return 1;
+}
+
+static int tcp_connect(const char *host, unsigned int port, int timeout_ms) {
+    struct addrinfo hints, *res, *ai;
+    char portstr[8];
+    int fd = -1, rc;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    snprintf(portstr, sizeof(portstr), "%u", port);
+
+    rc = getaddrinfo(host, portstr, &hints, &res);
+    if(rc) {
+        fprintf(stderr, "dc-tool: %s: %s\n", host, gai_strerror(rc));
+        return -1;
+    }
+
+    for(ai = res; ai; ai = ai->ai_next) {
+        int fl, one = 1;
+
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if(fd < 0)
+            continue;
+
+        /* Non-blocking connect with a deadline: a wrong address should fail
+           in seconds, not after the kernel's minutes-long default. */
+        fl = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+
+        rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if(rc < 0 && errno == EINPROGRESS) {
+            fd_set wf;
+            struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
+
+            FD_ZERO(&wf);
+            FD_SET(fd, &wf);
+
+            if(select(fd + 1, NULL, &wf, NULL, &tv) > 0) {
+                int err = 0;
+                socklen_t el = sizeof(err);
+
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
+                errno = err;
+                rc = err ? -1 : 0;
+            }
+            else {
+                errno = ETIMEDOUT;
+                rc = -1;
+            }
+        }
+
+        if(rc == 0) {
+            /* Remember the numeric address. Every control-port command is a
+               fresh connection, and resolving a .local name through mDNS
+               can take seconds each time -- long enough that dcload gives up
+               waiting for a speed change to be confirmed. */
+            if(host == tcp_host)
+                getnameinfo(ai->ai_addr, ai->ai_addrlen, tcp_host,
+                            sizeof(tcp_host), NULL, 0, NI_NUMERICHOST);
+            fcntl(fd, F_SETFL, fl);
+            /* Nagle would hold the 2nd..4th byte of every send_uint() until
+               the ESP32's delayed ACK: mandatory, not an optimisation. */
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+            break;
+        }
+
+        close(fd);
+        fd = -1;
+    }
+
+    freeaddrinfo(res);
+
+    if(fd < 0)
+        fprintf(stderr, "dc-tool: connect %s:%u: %s\n", host, port, strerror(errno));
+
+    return fd;
+}
+
+/* One request, one reply line, on a fresh connection to the control port.
+   Returns 0 on "ok ...", -2 on "err ..." (reply holds the text), and -1 when
+   the port is unreachable -- older firmware, or a plain TCP-serial box -- in
+   which case the bridge is assumed to be fixed at initial_speed. */
+static int esp_ctl(char *reply, size_t n, const char *fmt, ...) {
+    char line[128];
+    va_list ap;
+    int fd, len, got = 0;
+    fd_set rf;
+    struct timeval tv;
+
+    reply[0] = '\0';
+
+    fd = tcp_connect(tcp_host, tcp_ctl_port, 3000);
+    if(fd < 0) {
+        if(!ctl_warned) {
+            fprintf(stderr, "dc-tool: ESP32 control port %u unreachable; "
+                            "assuming the bridge is fixed at %u baud\n",
+                    tcp_ctl_port, initial_speed);
+            ctl_warned = 1;
+        }
+        ctl_available = 0;
+        return -1;
+    }
+
+    va_start(ap, fmt);
+    len = vsnprintf(line, sizeof(line) - 1, fmt, ap);
+    va_end(ap);
+    line[len++] = '\n';
+
+    if(write(fd, line, len) != len) {
+        close(fd);
+        return -1;
+    }
+
+    for(;;) {
+        int r;
+
+        FD_ZERO(&rf);
+        FD_SET(fd, &rf);
+        tv.tv_sec = 3;
+        tv.tv_usec = 0;
+
+        if(select(fd + 1, &rf, NULL, NULL, &tv) <= 0)
+            break;
+
+        r = read(fd, reply + got, n - 1 - got);
+        if(r <= 0)
+            break;
+
+        got += r;
+        reply[got] = '\0';
+
+        if(strchr(reply, '\n') || got >= (int)n - 1)
+            break;
+    }
+
+    close(fd);
+
+    reply[strcspn(reply, "\r\n")] = '\0';
+
+    if(!strncmp(reply, "ok", 2))
+        return 0;
+
+    if(!got)
+        snprintf(reply, n, "no reply");
+
+    return -2;
+}
+
+static void transport_close(void) {
+    if(tcp_fd >= 0) {
+        close(tcp_fd);
+        tcp_fd = -1;
+    }
+}
+#endif /* !_WIN32 */
+
 void cleanup(void) {
     if(!gdb_socket_started)
         return;
@@ -298,57 +594,137 @@ int serial_putc(char ch) {
     return count;
 }
 #else
+static int io_fd(void) {
+    return xport == XP_TCP ? tcp_fd : dcfd;
+}
+
 int serial_read(void *buffer, int count) {
-    return read(dcfd,buffer,count);
+    return read(io_fd(), buffer, count);
 }
 
 int serial_write(void *buffer, int count) {
-    return write(dcfd,buffer,count);
+    unsigned char *p = buffer;
+    int left = count;
+
+    /* A tty write is normally complete; a socket write may not be. */
+    while(left > 0) {
+        int w = write(io_fd(), p, left);
+
+        if(w < 0) {
+            if(errno == EINTR)
+                continue;
+            return -1;
+        }
+
+        p += w;
+        left -= w;
+    }
+
+    return count;
 }
 
 int serial_putc(char ch) {
-    return write(dcfd,&ch,1);
+    return serial_write(&ch, 1);
 }
 #endif /* _WIN32 */
 
+/* serial_read() with a deadline. Returns -2 on timeout; 0 = unbounded. */
+static int serial_read_timeout(void *buffer, int count, int ms) {
+#ifndef _WIN32
+    if(ms > 0) {
+        fd_set rf;
+        struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
+        int fd = io_fd();
+
+        FD_ZERO(&rf);
+        FD_SET(fd, &rf);
+
+        if(select(fd + 1, &rf, NULL, NULL, &tv) <= 0)
+            return -2;
+    }
+#else
+    (void)ms;
+#endif
+    return serial_read(buffer, count);
+}
+
+/* Something went wrong on the link. There is nothing to recover -- dcload has
+   no resync -- so say what happened and leave the port tidy. */
+static void link_failed(const char *why) {
+    fprintf(stderr, "\ndc-tool: %s\n", why);
+    finish_serial();
+    exit(2);
+}
+
 /* read count bytes from dc into buf */
 void blread(void *buf, int count) {
-    int retval;
+    int retval, want = count;
     unsigned char *tmp = buf;
 
     while(count) {
-        retval = serial_read(tmp, count);
-        if(retval == -1)
-            printf("blread: read error!\n");
-        else {
-            tmp += retval;
-            count -= retval;
+        retval = serial_read_timeout(tmp, count, io_timeout_ms);
+
+        if(retval == -2) {
+            char msg[160];
+
+            snprintf(msg, sizeof(msg), "timed out after %d ms waiting for %d "
+                     "byte(s) from dcload (%d received). Is the Dreamcast at "
+                     "dcload's prompt, and are both ends at the same baud?",
+                     io_timeout_ms, want, want - count);
+            link_failed(msg);
         }
+
+        if(retval == 0)
+            link_failed("connection to the Dreamcast closed");
+
+        if(retval < 0) {
+            if(errno == EINTR)
+                continue;
+            link_failed(strerror(errno));
+        }
+
+        tmp += retval;
+        count -= retval;
     }
 }
 
 char serial_getc(void) {
-    int retval;
-    char tmp;
+    unsigned char tmp;
 
-    retval = serial_read(&tmp, 1);
-    if(retval == -1) {
-        printf("serial_getc: read error!\n");
-        tmp = 0x00;
+    blread(&tmp, 1);
+
+    return (char)tmp;
+}
+
+/* dcload echoes every command byte before acting on it. Insist on it: a
+   mismatch here is the earliest possible sign of a baud or sync problem, and
+   ignoring it (as the original tool did) turns it into a silent hang. */
+void expect_echo(unsigned char c) {
+    unsigned char got;
+
+    blread(&got, 1);
+
+    if(got != c) {
+        char msg[160];
+
+        snprintf(msg, sizeof(msg), "expected dcload to echo '%c' (0x%02x), got "
+                 "0x%02x -- is the Dreamcast at dcload's prompt and at %u baud?",
+                 c >= 32 && c < 127 ? c : '?', c, got, initial_speed);
+        link_failed(msg);
     }
-
-    return tmp;
 }
 
 /* send 4 bytes */
 int send_uint(unsigned int value) {
-    unsigned int tmp = value;
+    unsigned char b[4];
+    unsigned int tmp;
 
-    /* send little-endian */
-    serial_putc((char)(tmp & 0xFF));
-    serial_putc((char)((tmp >> 0x08) & 0xFF));
-    serial_putc((char)((tmp >> 0x10) & 0xFF));
-    serial_putc((char)((tmp >> 0x18) & 0xFF));
+    /* send little-endian, in one write */
+    b[0] = (unsigned char)(value & 0xFF);
+    b[1] = (unsigned char)((value >> 0x08) & 0xFF);
+    b[2] = (unsigned char)((value >> 0x10) & 0xFF);
+    b[3] = (unsigned char)((value >> 0x18) & 0xFF);
+    serial_write(b, 4);
 
     /* get little-endian */
     tmp =  ((unsigned int) (serial_getc() & 0xFF));
@@ -356,10 +732,78 @@ int send_uint(unsigned int value) {
     tmp |= ((unsigned int) (serial_getc() & 0xFF) << 0x10);
     tmp |= ((unsigned int) (serial_getc() & 0xFF) << 0x18);
 
-    if(tmp != value)
-        return 0;
+    if(tmp != value) {
+        char msg[120];
+
+        snprintf(msg, sizeof(msg), "dcload echoed 0x%08x for 0x%08x: protocol "
+                 "desync (baud mismatch?)", tmp, value);
+        link_failed(msg);
+    }
 
     return 1;
+}
+
+/* Read the 4-byte echo of a value written earlier as part of a burst. */
+static void expect_uint(unsigned int value) {
+    unsigned int tmp;
+
+    tmp =  ((unsigned int) (serial_getc() & 0xFF));
+    tmp |= ((unsigned int) (serial_getc() & 0xFF) << 0x08);
+    tmp |= ((unsigned int) (serial_getc() & 0xFF) << 0x10);
+    tmp |= ((unsigned int) (serial_getc() & 0xFF) << 0x18);
+
+    if(tmp != value) {
+        char msg[120];
+
+        snprintf(msg, sizeof(msg), "dcload echoed 0x%08x for 0x%08x: protocol "
+                 "desync (baud mismatch?)", tmp, value);
+        link_failed(msg);
+    }
+}
+
+static void put_le32(unsigned char *b, unsigned int v) {
+    b[0] = (unsigned char)(v & 0xFF);
+    b[1] = (unsigned char)((v >> 0x08) & 0xFF);
+    b[2] = (unsigned char)((v >> 0x10) & 0xFF);
+    b[3] = (unsigned char)((v >> 0x18) & 0xFF);
+}
+
+/* Ask dcload what it is. Returns the version string ("1.0.8") or NULL. */
+static const char *probe_version(void) {
+    static char line[80];
+    unsigned char c;
+    size_t n = 0;
+
+    c = 'V';
+    serial_write(&c, 1);
+    expect_echo('V');
+
+    /* "dcload-serial 1.0.8\n\r" -- read to the '\r'. */
+    for(;;) {
+        blread(&c, 1);
+        if(c == '\r')
+            break;
+        if(n < sizeof(line) - 1 && c != '\n')
+            line[n++] = (char)c;
+    }
+    line[n] = '\0';
+
+    if(strncmp(line, "dcload-serial ", 14))
+        return NULL;
+
+    return line + 14;
+}
+
+/* 1 if "a.b.c" is at least major.minor.patch. */
+static int version_at_least(const char *v, int major, int minor, int patch) {
+    int a = 0, b = 0, c = 0;
+
+    if(sscanf(v, "%d.%d.%d", &a, &b, &c) < 2)
+        return 0;
+
+    if(a != major) return a > major;
+    if(b != minor) return b > minor;
+    return c >= patch;
 }
 
 /* receive 4 bytes */
@@ -438,7 +882,6 @@ void recv_data(void *data, unsigned int total, unsigned int verbose) {
 /* send size bytes to dc from addr */
 void send_data(unsigned char *addr, unsigned int size, unsigned int verbose) {
     unsigned int i;
-    unsigned char *location = (unsigned char *) addr;
     unsigned char sum = 0;
     unsigned char data;
     lzo_uint csize;
@@ -467,18 +910,35 @@ void send_data(unsigned char *addr, unsigned int size, unsigned int verbose) {
                 printf("C");
                 fflush(stdout);
             }
-            c = 'C';
-            serial_write(&c, 1);
-            send_uint(csize);
-            data = 'B';
+            sum = 0;
+            for(i = 0; i < csize; i++)
+                sum ^= buffer[i];
+
+            if(pipelined) {
+                /* header + size + payload + checksum in one go; the size echo
+                   comes back while the payload is still in flight. */
+                unsigned char hdr[5];
+
+                hdr[0] = 'C';
+                put_le32(hdr + 1, csize);
+                serial_write(hdr, 5);
+                serial_write(buffer, csize);
+                serial_write(&sum, 1);
+                expect_uint(csize);
+                blread(&data, 1);
+            }
+            else {
+                c = 'C';
+                serial_write(&c, 1);
+                send_uint(csize);
+                serial_write(buffer, csize);
+                serial_write(&sum, 1);
+                blread(&data, 1);
+            }
+
+            /* A bad decompress: dcload asks for the same payload again. */
             while(data != 'G') {
-                location = buffer;
-                serial_write(location, csize);
-                sum = 0;
-                for(i = 0; i < csize; i++) {
-                    data = *(location++);
-                    sum ^= data;
-                }
+                serial_write(buffer, csize);
                 serial_write(&sum, 1);
                 blread(&data, 1);
             }
@@ -488,16 +948,30 @@ void send_data(unsigned char *addr, unsigned int size, unsigned int verbose) {
                 printf("U");
                 fflush(stdout);
             }
-            c = 'U';
-            serial_write(&c, 1);
-            send_uint(sendsize);
-            serial_write((unsigned char *)addr, sendsize);
             sum = 0;
             for (i = 0; i < sendsize; i++) {
                 sum ^= ((unsigned char *)addr)[i];
             }
-            serial_write(&sum, 1);
-            blread(&data, 1);
+
+            if(pipelined) {
+                unsigned char hdr[5];
+
+                hdr[0] = 'U';
+                put_le32(hdr + 1, sendsize);
+                serial_write(hdr, 5);
+                serial_write((unsigned char *)addr, sendsize);
+                serial_write(&sum, 1);
+                expect_uint(sendsize);
+                blread(&data, 1);
+            }
+            else {
+                c = 'U';
+                serial_write(&c, 1);
+                send_uint(sendsize);
+                serial_write((unsigned char *)addr, sendsize);
+                serial_write(&sum, 1);
+                blread(&data, 1);
+            }
         }
 
         size -= sendsize;
@@ -662,6 +1136,27 @@ int open_serial(const char *devicename, unsigned int speed, unsigned int *speedt
     speed_t baudconst;
     unsigned int oldspeed;
 
+    cur_speed = speed;
+
+    if(xport == XP_TCP) {
+        char reply[64];
+
+        if(tcp_fd < 0) {
+            tcp_fd = tcp_connect(tcp_host, tcp_port, 5000);
+            if(tcp_fd < 0)
+                exit(-1);
+        }
+
+        /* Put the bridge at the rate dcload is at. Unreachable is tolerated
+           (fixed-rate bridge); a refusal is not. */
+        if(esp_ctl(reply, sizeof(reply), "baud %u", speed) == -2) {
+            fprintf(stderr, "dc-tool: ESP32 refused baud %u: %s\n", speed, reply);
+            exit(-1);
+        }
+
+        return 0;
+    }
+
     dcfd = open(devicename, O_RDWR | O_NOCTTY);
     if(dcfd < 0) {
         perror(devicename);
@@ -727,7 +1222,10 @@ void finish_serial(void) {
 #ifdef _WIN32
     FlushFileBuffers(hCommPort);
 #else
-    tc_set_attr(dcfd, &oldtio);
+    if(xport == XP_TCP)
+        transport_close();      /* the bridge restores its baud on close */
+    else
+        tc_set_attr(dcfd, &oldtio);
 #endif
     cleanup();
 }
@@ -738,7 +1236,10 @@ void close_serial(void) {
     FlushFileBuffers(hCommPort);
     CloseHandle(hCommPort);
 #else
-    tc_close(dcfd);
+    if(xport == XP_TCP)
+        transport_close();
+    else
+        tc_close(dcfd);
 #endif
 }
 
@@ -757,7 +1258,7 @@ int change_speed(char *device_name, unsigned int speed) {
 
     c = 'S';
     serial_write(&c, 1);
-    blread(&c, 1);
+    expect_echo('S');
 
     if(speedhack && (speed == 115200))
         send_uint(111607); /* get dcload to pick N=13 rather than N=12 */
@@ -769,13 +1270,39 @@ int change_speed(char *device_name, unsigned int speed) {
         send_uint(speed);
 
     printf("Changing speed to %d bps... ", speed);
-    close_serial();
+    fflush(stdout);
 
-    if(open_serial(device_name, speed, &dummy)<0)
-        return 1;
+#ifndef _WIN32
+    if(xport == XP_TCP) {
+        char reply[64];
 
+        /* dcload has echoed the new rate and is re-initialising its SCI. The
+           echo has already reached us, so nothing is left in flight on the
+           wire in either direction; switch the bridge now. */
+        if(esp_ctl(reply, sizeof(reply), "baud %u", speed) == -2) {
+            printf("failed: ESP32 said \"%s\"\n", reply);
+            return 1;
+        }
+
+        usleep(20000);      /* dcload's scif_init() settling time, with margin */
+        cur_speed = speed;
+    }
+    else
+#endif
+    {
+        close_serial();
+
+        if(open_serial(device_name, speed, &dummy)<0)
+            return 1;
+    }
+
+    /* Both sides now confirm the new rate with a known word. send_uint()
+       already checks dcload's echo; dcload then sends it back a second time. */
     send_uint(rv);
-    rv = recv_uint();
+
+    if(recv_uint() != rv)
+        link_failed("speed change handshake failed: the two ends are not at the same rate");
+
     printf("done\n");
 
     return 0;
@@ -849,7 +1376,13 @@ void usage(void) {
     printf("-a <address>  Set address to <address> (default: 0x8c010000)\n");
     printf("-s <size>     Set size to <size>\n");
     printf("-t <device>   Use <device> to communicate with dc (default: %s)\n", SERIALDEVICE);
+    printf("              tcp:<host>[:<port>] talks to an esp32-dc bridge directly\n");
+    printf("              (default port 2323; baud control on port+1)\n");
     printf("-b <baudrate> Use <baudrate> (default: %d)\n", DEFAULT_SPEED);
+    printf("-B <baudrate> Rate dcload boots at (default: %d)\n", INITIAL_SPEED);
+    printf("-T <ms>       Give up if dcload is silent for <ms> (default: 5000, 0 = never)\n");
+    printf("-P            Use the original protocol: no pipelined or streamed uploads,\n");
+    printf("              and console writes wait for the host as before\n");
     printf("-e            Try alternate 115200/230400 (must also use -b 115200 or -b 230400)\n");
     printf("-E            Use an external clock for the DC's serial port\n");
     printf("-n            Do not attach console and fileserver\n");
@@ -880,6 +1413,153 @@ int start_ws(void) {
     return 0;
 }
 #endif
+
+static void put_le32(unsigned char *b, unsigned int v);
+static void expect_uint(unsigned int value);
+
+/* One section through the 'b' command. Returns 0, or -1 if dcload refused a
+   batch three times in a row. */
+static int send_section_stream(unsigned int addr, unsigned char *data,
+                               unsigned int size) {
+    unsigned char *cbuf = malloc(DCLOADBUFFER + DCLOADBUFFER / 64 + 16 + 3);
+    unsigned char *batch = malloc(STREAM_SCRATCH_LEN * 2 + STREAM_MAX_BLOCKS * 16 + 16);
+    unsigned char hdr[8], c;
+    unsigned int off = 0;
+
+    c = 'b';
+    serial_write(&c, 1);
+    expect_echo('b');
+
+    put_le32(hdr, addr);
+    put_le32(hdr + 4, size);
+    serial_write(hdr, 8);
+    expect_uint(addr);
+    expect_uint(size);
+    send_uint(stream_scratch);
+    send_uint(STREAM_SCRATCH_LEN);
+
+    printf("send_stream: ");
+    fflush(stdout);
+
+    while(off < size) {
+        unsigned int blen = 0, scratch_used = 0, nblk = 0, sum = 0, start = off;
+        unsigned int i, tries;
+
+        /* Build the batch: blocks until the scratch area, the block table or
+           the section runs out. Uncompressed blocks cost no scratch. */
+        while(off < size && nblk < STREAM_MAX_BLOCKS &&
+              blen + 9 + DCLOADBUFFER <= STREAM_BATCH_WIRE) {
+            unsigned int raw = size - off > DCLOADBUFFER ? DCLOADBUFFER : size - off;
+            lzo_uint clen;
+            unsigned char *p = batch + blen;
+
+            lzo1x_1_compress(data + off, raw, cbuf, &clen, wrkmem);
+
+            if(clen < raw) {
+                if(scratch_used + clen > STREAM_SCRATCH_LEN)
+                    break;
+                p[0] = 'C';
+                put_le32(p + 1, (unsigned int)clen);
+                put_le32(p + 5, raw);
+                memcpy(p + 9, cbuf, clen);
+                for(i = 0; i < clen; i++)
+                    sum += cbuf[i];
+                blen += 9 + (unsigned int)clen;
+                scratch_used += (unsigned int)clen;
+            }
+            else {
+                p[0] = 'U';
+                put_le32(p + 1, raw);
+                put_le32(p + 5, raw);
+                memcpy(p + 9, data + off, raw);
+                for(i = 0; i < raw; i++)
+                    sum += data[off + i];
+                blen += 9 + raw;
+            }
+
+            nblk++;
+            off += raw;
+        }
+
+        batch[blen] = 'E';
+        put_le32(batch + blen + 1, sum);
+        blen += 5;
+
+        for(tries = 0; ; tries++) {
+            /* The ack comes after the whole batch has crossed the wire, so
+               the wait has to include its transmission time. */
+            int saved = io_timeout_ms;
+
+            serial_write(batch, blen);
+            if(io_timeout_ms > 0 && cur_speed > 0)
+                io_timeout_ms += (int)((unsigned long long)blen * 10 * 1000 * 3 /
+                                       (2ULL * cur_speed));
+            blread(&c, 1);
+            io_timeout_ms = saved;
+
+            if(c == 'G')
+                break;
+
+            if(c != 'B' || tries >= 2) {
+                printf("\n");
+                if(c == 'B')
+                    link_failed("dcload rejected the same batch three times");
+                {
+                    char msg[80];
+                    snprintf(msg, sizeof(msg), "unexpected reply 0x%02x to a stream batch", c);
+                    link_failed(msg);
+                }
+            }
+
+            printf("!");        /* batch resent */
+            fflush(stdout);
+        }
+
+        printf("#");
+        fflush(stdout);
+    }
+
+    printf("\n");
+    free(cbuf);
+    free(batch);
+    return 0;
+}
+
+/* After the 'B' echo: address and size. dcload echoes the address at once
+   and the size only after it has drawn the progress bar, so the two can go
+   out together but the size echo must be waited for before any data. */
+static void send_section_header(unsigned int addr, unsigned int size) {
+    if(pipelined) {
+        unsigned char hdr[8];
+
+        put_le32(hdr, addr);
+        put_le32(hdr + 4, size);
+        serial_write(hdr, 8);
+        expect_uint(addr);
+        expect_uint(size);
+    }
+    else {
+        send_uint(addr);
+        send_uint(size);
+    }
+}
+
+/* Send one section, streamed when dcload supports it and a scratch area
+   exists, one acknowledged block at a time otherwise. */
+static void send_section(unsigned int addr, unsigned char *data, unsigned int size) {
+    unsigned char c;
+
+    if(streaming && stream_scratch) {
+        send_section_stream(addr, data, size);
+        return;
+    }
+
+    c = 'B';
+    serial_write(&c, 1);
+    expect_echo('B');
+    send_section_header(addr, size);
+    send_data(data, size, 1);
+}
 
 unsigned int upload(unsigned char *filename, unsigned int address) {
     int inputfd;
@@ -914,6 +1594,12 @@ unsigned int upload(unsigned char *filename, unsigned int address) {
             size = 0;
             printf("start address is 0x%x\n", address);
 
+            nranges = 0;
+            for(section = somebfd->sections; section != NULL; section = section->next)
+                if((section->flags & SEC_LOAD) && bfd_section_size(section))
+                    note_range(section->lma, bfd_section_size(section));
+            choose_scratch();
+
             gettimeofday(&starttime, 0);
 
             for(section = somebfd->sections; section != NULL; section = section->next) {
@@ -927,14 +1613,7 @@ unsigned int upload(unsigned char *filename, unsigned int address) {
                         inbuf = malloc(sectsize);
                         bfd_get_section_contents(somebfd, section, inbuf, 0, sectsize);
 
-                        c = 'B';
-                        serial_write(&c, 1);
-                        blread(&c, 1);
-
-                        send_uint(section->lma);
-                        send_uint(sectsize);
-
-                        send_data(inbuf, sectsize, 1);
+                        send_section(section->lma, inbuf, sectsize);
 
                         free(inbuf);
                     }
@@ -979,6 +1658,16 @@ unsigned int upload(unsigned char *filename, unsigned int address) {
             exit(-1);
         }
 
+        /* Every section's address range first, so the streaming scratch
+           area can be placed clear of all of them. */
+        nranges = 0;
+        while((section = elf_nextscn(elf, section))) {
+            if((shdr = elf32_getshdr(section)) && shdr->sh_addr && shdr->sh_size)
+                note_range(shdr->sh_addr, shdr->sh_size);
+        }
+        choose_scratch();
+        section = NULL;
+
         gettimeofday(&starttime, 0);
         while((section = elf_nextscn(elf, section))) {
             if(!(shdr = elf32_getshdr(section))) {
@@ -1003,16 +1692,22 @@ unsigned int upload(unsigned char *filename, unsigned int address) {
                    shdr->sh_addr, shdr->sh_size);
             size += shdr->sh_size;
 
-            c = 'B';
-            serial_write(&c, 1);
-            blread(&c, 1);
+            {
+                /* A section may come in several data pieces; the protocol
+                   wants one contiguous buffer. */
+                unsigned char *sbuf = malloc(shdr->sh_size);
+                unsigned int got = 0;
 
-            send_uint(shdr->sh_addr);
-            send_uint(shdr->sh_size);
+                do {
+                    if(data->d_buf && got + data->d_size <= shdr->sh_size) {
+                        memcpy(sbuf + got, data->d_buf, data->d_size);
+                        got += data->d_size;
+                    }
+                } while((data = elf_getdata(section, data)));
 
-            do {
-                send_data(data->d_buf, data->d_size, 1);
-            } while((data = elf_getdata(section, data)));
+                send_section(shdr->sh_addr, sbuf, got);
+                free(sbuf);
+            }
         }
 
         elf_end(elf);
@@ -1043,14 +1738,11 @@ unsigned int upload(unsigned char *filename, unsigned int address) {
 
     gettimeofday(&starttime, 0);
 
-    c = 'B';
-    serial_write(&c, 1);
-    blread(&c, 1);
+    nranges = 0;
+    note_range(address, size);
+    choose_scratch();
 
-    send_uint(address);
-    send_uint(size);
-
-    send_data(inbuf, size, 1);
+    send_section(address, inbuf, size);
 
 done_transfer:
     gettimeofday(&endtime, 0);
@@ -1084,12 +1776,9 @@ void download(unsigned char *filename, unsigned int address,
 
     data = malloc(size);
 
-    if(!quiet)
-        serial_write("F", 1);
-    else
-        serial_write("G", 1);
-
-    serial_read(&c, 1);
+    c = quiet ? 'G' : 'F';
+    serial_write(&c, 1);
+    expect_echo(c);
     send_uint(address);
     send_uint(size);
     send_uint(wrkmem);
@@ -1116,8 +1805,9 @@ void execute(unsigned int address, unsigned int console) {
 
     printf("Sending execute command (0x%x, console=%d)...", address, console);
 
-    serial_write("A", 1);
-    serial_read(&c, 1);
+    c = 'A';
+    serial_write(&c, 1);
+    expect_echo('A');
 
     send_uint(address);
     send_uint(console);
@@ -1142,8 +1832,16 @@ void do_console(unsigned char *path, unsigned char *isofile) {
 #endif
 
     while(1) {
+        int r;
+
         fflush(stdout);
-        serial_read(&command, 1);
+
+        /* Unbounded on purpose: a program may be silent for hours. */
+        r = serial_read(&command, 1);
+        if(r == 0 || (r < 0 && errno != EINTR))
+            link_failed("connection to the Dreamcast closed");
+        if(r < 0)
+            continue;
 
         switch(command) {
             case 0:
@@ -1216,6 +1914,9 @@ void do_console(unsigned char *path, unsigned char *isofile) {
             case 22:
                 dc_exit();
                 break;
+            case 23:
+                dc_write_nowait();
+                break;
             default:
                 printf("Unimplemented command (%d) \n", command);
                 printf("Assuming program has exited, or something...\n");
@@ -1250,9 +1951,9 @@ void do_dumbterm(void) {
 }
 
 #ifdef __MINGW32__
-#define AVAILABLE_OPTIONS       "x:u:d:a:s:t:b:i:v:npqheEg"
+#define AVAILABLE_OPTIONS       "x:u:d:a:s:t:b:B:T:i:v:npqheEgP"
 #else
-#define AVAILABLE_OPTIONS       "x:u:d:a:s:t:b:c:i:v:npqheEg"
+#define AVAILABLE_OPTIONS       "x:u:d:a:s:t:b:B:T:c:i:v:npqheEgP"
 #endif
 
 int main(int argc, char *argv[]) {
@@ -1327,6 +2028,15 @@ int main(int argc, char *argv[]) {
                 break;
             case 'b':
                 speed = strtoul(optarg, NULL, 0);
+                break;
+            case 'B':
+                initial_speed = strtoul(optarg, NULL, 0);
+                break;
+            case 'T':
+                io_timeout_ms = (int)strtol(optarg, NULL, 0);
+                break;
+            case 'P':
+                no_pipeline = 1;
                 break;
             case 'n':
                 console = 0;
@@ -1410,20 +2120,55 @@ int main(int argc, char *argv[]) {
     if(enabled_log_groups)
         printf("Fileserver request logging enabled\n");
 
+#ifndef _WIN32
+    if(parse_transport(device_name))
+        printf("Transport: tcp %s:%u (baud control on port %u)\n",
+               tcp_host, tcp_port, tcp_ctl_port);
+#endif
+
 #ifndef __APPLE__
     /* test for reasonable baud - this is for POSIX systems */
-    if(speed != INITIAL_SPEED) {
+    if(xport == XP_SERIAL && speed != initial_speed) {
         if(open_serial(device_name, speed, &speed)<0)
             return 1;
         close_serial();
     }
 #endif
-  
-    if(open_serial(device_name, INITIAL_SPEED, &dummy)<0)
+
+    if(open_serial(device_name, initial_speed, &dummy)<0)
         return 1;
 
-    if(speed != INITIAL_SPEED)
-        change_speed(device_name, speed);
+    /* Who is on the other end? Also the first thing that fails if the rate
+       is wrong, with a message that says so. */
+    {
+        const char *ver = probe_version();
+
+        if(ver && version_at_least(ver, 1, 0, 8) && !no_pipeline)
+            pipelined = 1;
+        if(ver && version_at_least(ver, 1, 0, 9) && !no_pipeline)
+            streaming = 1;
+        if(ver && version_at_least(ver, 1, 0, 10) && !no_pipeline)
+            console_nowait = 1;
+
+        printf("dcload-serial %s%s\n", ver ? ver : "(unknown version)",
+               streaming ? ", streaming uploads" :
+               pipelined ? ", pipelined uploads" : "");
+    }
+
+#ifndef _WIN32
+    /* A bridge that cannot be told about a speed change must not be asked
+       for one: dcload would switch, the bridge would not, and every byte
+       after that would be lost. Stay at the boot rate instead. */
+    if(xport == XP_TCP && !ctl_available && speed != initial_speed) {
+        printf("No control port: staying at %u baud (use -B to declare a "
+               "fixed-rate bridge)\n", initial_speed);
+        speed = initial_speed;
+    }
+#endif
+
+    if(speed != initial_speed)
+        if(change_speed(device_name, speed))
+            return 1;
 
     switch(command) {
         case 'x':
@@ -1431,7 +2176,16 @@ int main(int argc, char *argv[]) {
                 unsigned char c;
                 c = 'H';
                 serial_write(&c, 1);
-                blread(&c, 1);
+                expect_echo('H');
+            }
+            /* Let dcload send console output without waiting for replies.
+               It forgets this whenever it restarts, so ask every run. */
+            if(console_nowait && console) {
+                unsigned char c = 'W';
+
+                serial_write(&c, 1);
+                expect_echo('W');
+                printf("Console output: no-reply writes\n");
             }
             printf("Upload <%s>\n", filename);
             address = upload(filename, address);
@@ -1445,7 +2199,8 @@ int main(int argc, char *argv[]) {
         case 'u':
             printf("Upload <%s> at <0x%x>\n", filename, address);
             upload(filename, address);
-            change_speed(device_name, INITIAL_SPEED);
+            if(speed != initial_speed)
+                change_speed(device_name, initial_speed);
             break;
         case 'd':
             if(!size) {
@@ -1456,7 +2211,8 @@ int main(int argc, char *argv[]) {
             printf("Download %d bytes at <0x%x> to <%s>\n", size, address,
                 filename);
             download(filename, address, size, quiet);
-            change_speed(device_name, INITIAL_SPEED);
+            if(speed != initial_speed)
+                change_speed(device_name, initial_speed);
             break;
         default:
             if(dumbterm)
@@ -1467,6 +2223,7 @@ int main(int argc, char *argv[]) {
             break;
     }
 
+    close_serial();
     cleanup();
     exit(0);
 }

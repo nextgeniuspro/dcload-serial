@@ -34,7 +34,7 @@ extern unsigned int send_data_block_compressed(unsigned char * addr,
                            unsigned int size);
 extern unsigned int get_uint(void);
 
-extern int put_uint(unsigned int val);
+extern void put_uint(unsigned int val);
 
 int strlen(const char *s) {
     int c = 0;
@@ -59,7 +59,31 @@ int read(int fd, void *buf, size_t count) {
     return (get_uint());
 }
 
+/* Set by dc-tool's 'W' command for the current run (cleared whenever dcload
+   restarts), meaning the host understands command 23. */
+unsigned int console_nowait = 0;
+
 int write(int fd, const void *buf, size_t count) {
+    /* Console output needs no answer, so do not wait for one. The normal
+       path costs two round trips to the host -- with interrupts off, since
+       KallistiOS runs dcload syscalls that way -- and over Wi-Fi that is a
+       visible stall on every printf. This costs only the time the bytes take
+       on the wire. Files keep the full exchange: their return value matters.
+
+       Command 23: fd, count, then count raw bytes. Nothing comes back. */
+    if(console_nowait && (fd == 1 || fd == 2)) {
+        const unsigned char *p = buf;
+        size_t i;
+
+        scif_putchar(23);
+        put_uint(fd);
+        put_uint(count);
+        for(i = 0; i < count; i++)
+            scif_putchar(p[i]);
+
+        return count;
+    }
+
     scif_putchar(2);
     put_uint(fd);
     put_uint(count);

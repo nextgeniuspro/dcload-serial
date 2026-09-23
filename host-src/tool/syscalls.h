@@ -46,6 +46,7 @@ void help_log_groups(void);
 
 void dc_fstat(void);
 void dc_write(void);
+void dc_write_nowait(void);
 void dc_read(void);
 void dc_open(void);
 void dc_close(void);

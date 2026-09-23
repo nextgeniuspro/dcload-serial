@@ -19,7 +19,7 @@
  *
  */
 
-#include "scif.h"
+#include "sci.h"
 
 extern void load_data_block_general(unsigned char *addr,
                                          unsigned int size, unsigned int verbose);

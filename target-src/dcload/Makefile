@@ -4,13 +4,13 @@ LZOPATH = ../../minilzo-2.10
 LZO	= ../../host-src/misc/lzo
 
 CC	= $(TARGETCC)
-CFLAGS	= $(TARGETCFLAGS) -DDCLOAD_VERSION=\"$(VERSION)\"
+CFLAGS	= $(TARGETCFLAGS) -DDCLOAD_VERSION=\"$(VERSION)\" -DINITIAL_SPEED=$(DCLOAD_INITIAL_SPEED)
 INCLUDE	= -I$(LZOPATH) -I../../target-inc
 
 OBJCOPY	= $(TARGETOBJCOPY)
 
-#DCLOBJECTS	= dcload-crt0.o syscalls.o memcpy.o memset.o memmove.o memcmp.o scif.o disable.o go.o video.o minilzo.o dcload.o cdfs_redir.o cdfs_syscalls.o bswap.o
-DCLOBJECTS	= dcload-crt0.o syscalls.o memcpy.o memset.o memmove.o memcmp.o scif.o disable.o go.o video.o minilzo.o dcload.o cdfs_redir.o cdfs_syscalls.o
+#DCLOBJECTS	= dcload-crt0.o syscalls.o memcpy.o memset.o memmove.o memcmp.o sci.o disable.o go.o video.o minilzo.o dcload.o cdfs_redir.o cdfs_syscalls.o bswap.o
+DCLOBJECTS	= dcload-crt0.o syscalls.o memcpy.o memset.o memmove.o memcmp.o sci.o disable.o go.o video.o minilzo.o dcload.o cdfs_redir.o cdfs_syscalls.o
 EXCOBJECTS	= exception.o
 LZOFILES = $(LZOPATH)/minilzo.c $(LZOPATH)/minilzo.h $(LZOPATH)/lzoconf.h
 

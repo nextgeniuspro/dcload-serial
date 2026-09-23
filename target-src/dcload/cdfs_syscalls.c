@@ -19,7 +19,7 @@
  *
  */
 
-#include "sci.h"
+#include "port.h"
 
 extern void load_data_block_general(unsigned char *addr,
                                          unsigned int size, unsigned int verbose);

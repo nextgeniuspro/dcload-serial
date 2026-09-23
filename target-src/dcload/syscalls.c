@@ -26,7 +26,7 @@
 #include <utime.h>
 #include <stdarg.h>
 #include <dirent.h>
-#include "scif.h"
+#include "port.h"
 
 extern void load_data_block_general(unsigned char *addr,
                            unsigned int size, unsigned int verbose);

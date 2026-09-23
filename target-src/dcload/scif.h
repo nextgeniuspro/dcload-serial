@@ -52,6 +52,11 @@
 /* line status register */
 #define SCLSR2  (volatile unsigned short *) 0xffe80024
 
+/* Receive give-up limit (0 = never) and the flag scif_getchar() raises when it
+   fires. Shared with the SCI build; see sci.c. */
+extern unsigned int sci_timeout_limit;
+extern unsigned int sci_aborted;
+
 void scif_flush(void);
 void scif_init(int bps);
 unsigned char scif_getchar(void);

@@ -19,7 +19,7 @@
  *
  */
 
-#include "sci.h"
+#include "port.h"
 #include "minilzo.h"
 #include "video.h"
 

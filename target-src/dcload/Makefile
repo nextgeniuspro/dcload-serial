@@ -5,12 +5,19 @@ LZO	= ../../host-src/misc/lzo
 
 CC	= $(TARGETCC)
 CFLAGS	= $(TARGETCFLAGS) -DDCLOAD_VERSION=\"$(VERSION)\" -DINITIAL_SPEED=$(DCLOAD_INITIAL_SPEED)
+
+ifeq ($(DCLOAD_PORT),scif)
+  PORTOBJ = scif.o
+  CFLAGS += -DDCLOAD_PORT_SCIF
+else
+  PORTOBJ = sci.o
+endif
 INCLUDE	= -I$(LZOPATH) -I../../target-inc
 
 OBJCOPY	= $(TARGETOBJCOPY)
 
 #DCLOBJECTS	= dcload-crt0.o syscalls.o memcpy.o memset.o memmove.o memcmp.o sci.o disable.o go.o video.o minilzo.o dcload.o cdfs_redir.o cdfs_syscalls.o bswap.o
-DCLOBJECTS	= dcload-crt0.o syscalls.o memcpy.o memset.o memmove.o memcmp.o sci.o disable.o go.o video.o minilzo.o dcload.o cdfs_redir.o cdfs_syscalls.o
+DCLOBJECTS	= dcload-crt0.o syscalls.o memcpy.o memset.o memmove.o memcmp.o $(PORTOBJ) disable.o go.o video.o minilzo.o dcload.o cdfs_redir.o cdfs_syscalls.o
 EXCOBJECTS	= exception.o
 LZOFILES = $(LZOPATH)/minilzo.c $(LZOPATH)/minilzo.h $(LZOPATH)/lzoconf.h
 
